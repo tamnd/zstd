@@ -228,10 +228,6 @@ static size_t HUF_DecompressFastArgs_init(HUF_DecompressFastArgs* args, void* ds
         size_t const length2 = MEM_readLE16(istart+2);
         size_t const length3 = MEM_readLE16(istart+4);
         size_t const length4 = srcSize - (length1 + length2 + length3 + 6);
-        args->iend[0] = istart + 6;  /* jumpTable */
-        args->iend[1] = args->iend[0] + length1;
-        args->iend[2] = args->iend[1] + length2;
-        args->iend[3] = args->iend[2] + length3;
 
         /* HUF_initFastDStream() requires this, and this small of an input
          * won't benefit from the ASM loop anyways.
@@ -239,6 +235,14 @@ static size_t HUF_DecompressFastArgs_init(HUF_DecompressFastArgs* args, void* ds
         if (length1 < 8 || length2 < 8 || length3 < 8 || length4 < 8)
             return 0;
         if (length4 > srcSize) return ERROR(corruption_detected);   /* overflow */
+
+        /* The ends of the streams are only formed once the lengths are known
+         * to fit in src, since a corrupted jump table would put them past its
+         * end, and C does not allow forming such a pointer even unused. */
+        args->iend[0] = istart + 6;  /* jumpTable */
+        args->iend[1] = args->iend[0] + length1;
+        args->iend[2] = args->iend[1] + length2;
+        args->iend[3] = args->iend[2] + length3;
     }
     /* ip[] contains the position that is currently loaded into bits[]. */
     args->ip[0] = args->iend[1] - sizeof(U64);
@@ -246,15 +250,17 @@ static size_t HUF_DecompressFastArgs_init(HUF_DecompressFastArgs* args, void* ds
     args->ip[2] = args->iend[3] - sizeof(U64);
     args->ip[3] = (BYTE const*)src + srcSize - sizeof(U64);
 
+    /* No point to call the ASM loop for tiny outputs. This is tested on the
+     * sizes rather than on op[3] >= oend, since for a tiny output op[3] would
+     * be past oend. */
+    if (3 * ((dstSize+3)/4) >= dstSize)
+        return 0;
+
     /* op[] contains the output pointers. */
     args->op[0] = (BYTE*)dst;
     args->op[1] = args->op[0] + (dstSize+3)/4;
     args->op[2] = args->op[1] + (dstSize+3)/4;
     args->op[3] = args->op[2] + (dstSize+3)/4;
-
-    /* No point to call the ASM loop for tiny outputs. */
-    if (args->op[3] >= oend)
-        return 0;
 
     /* bits[] is the bit container.
         * It is read from the MSB down to the LSB.
@@ -611,6 +617,16 @@ HUF_decompress4X1_usingDTable_internal_body(
     if (cSrcSize < 10) return ERROR(corruption_detected);  /* strict minimum : jump table + 1 byte per stream */
     if (dstSize < 6) return ERROR(corruption_detected);         /* stream 4-split doesn't work */
 
+    /* The stream starts and the output segments below are pointers into cSrc
+     * and dst, so their lengths are checked before any of them is formed. A
+     * corrupted jump table or a tiny dst would put them past the end of their
+     * buffer, and C does not allow forming such a pointer even to compare it. */
+    {   const BYTE* const istart = (const BYTE*) cSrc;
+        size_t const length123 = (size_t)MEM_readLE16(istart) + MEM_readLE16(istart+2) + MEM_readLE16(istart+4);
+        if (length123 + 6 > cSrcSize) return ERROR(corruption_detected);   /* overflow */
+        if (3 * ((dstSize+3) / 4) > dstSize) return ERROR(corruption_detected);   /* overflow */
+    }
+
     {   const BYTE* const istart = (const BYTE*) cSrc;
         BYTE* const ostart = (BYTE*) dst;
         BYTE* const oend = ostart + dstSize;
@@ -643,8 +659,8 @@ HUF_decompress4X1_usingDTable_internal_body(
         U32 const dtLog = dtd.tableLog;
         U32 endSignal = 1;
 
-        if (length4 > cSrcSize) return ERROR(corruption_detected);   /* overflow */
-        if (opStart4 > oend) return ERROR(corruption_detected);      /* overflow */
+        assert(length4 <= cSrcSize);   /* checked above */
+        assert(opStart4 <= oend);      /* checked above */
         assert(dstSize >= 6); /* validated above */
         CHECK_F( BIT_initDStream(&bitD1, istart1, length1) );
         CHECK_F( BIT_initDStream(&bitD2, istart2, length2) );
@@ -1392,10 +1408,22 @@ HUF_decompress4X2_usingDTable_internal_body(
     if (cSrcSize < 10) return ERROR(corruption_detected);   /* strict minimum : jump table + 1 byte per stream */
     if (dstSize < 6) return ERROR(corruption_detected);         /* stream 4-split doesn't work */
 
+    /* The stream starts and the output segments below are pointers into cSrc
+     * and dst, so their lengths are checked before any of them is formed. A
+     * corrupted jump table or a tiny dst would put them past the end of their
+     * buffer, and C does not allow forming such a pointer even to compare it. */
+    {   const BYTE* const istart = (const BYTE*) cSrc;
+        size_t const length123 = (size_t)MEM_readLE16(istart) + MEM_readLE16(istart+2) + MEM_readLE16(istart+4);
+        if (length123 + 6 > cSrcSize) return ERROR(corruption_detected);   /* overflow */
+        if (3 * ((dstSize+3) / 4) > dstSize) return ERROR(corruption_detected);   /* overflow */
+    }
+
     {   const BYTE* const istart = (const BYTE*) cSrc;
         BYTE* const ostart = (BYTE*) dst;
         BYTE* const oend = ostart + dstSize;
-        BYTE* const olimit = oend - (sizeof(size_t)-1);
+        /* dstSize can be below sizeof(size_t)-1, and then oend - (sizeof(size_t)-1)
+         * would be before ostart. ostart stops the loop below just the same. */
+        BYTE* const olimit = dstSize > sizeof(size_t)-1 ? oend - (sizeof(size_t)-1) : ostart;
         const void* const dtPtr = DTable+1;
         const HUF_DEltX2* const dt = (const HUF_DEltX2*)dtPtr;
 
@@ -1424,8 +1452,8 @@ HUF_decompress4X2_usingDTable_internal_body(
         DTableDesc const dtd = HUF_getDTableDesc(DTable);
         U32 const dtLog = dtd.tableLog;
 
-        if (length4 > cSrcSize) return ERROR(corruption_detected);  /* overflow */
-        if (opStart4 > oend) return ERROR(corruption_detected);     /* overflow */
+        assert(length4 <= cSrcSize);   /* checked above */
+        assert(opStart4 <= oend);      /* checked above */
         assert(dstSize >= 6 /* validated above */);
         CHECK_F( BIT_initDStream(&bitD1, istart1, length1) );
         CHECK_F( BIT_initDStream(&bitD2, istart2, length2) );

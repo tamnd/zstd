@@ -3156,7 +3156,9 @@ XXH32_update(XXH32_state_t* state, const void* input, size_t len)
             state->memsize = 0;
         }
 
-        if (p <= bEnd-16) {
+        /* Compared as a distance, since bEnd-16 is before the start of the
+         * input when fewer than 16 bytes are left, and C does not allow forming it. */
+        if ((size_t)(bEnd - p) >= 16) {
             const xxh_u8* const limit = bEnd - 16;
 
             do {
@@ -3598,7 +3600,9 @@ XXH64_update (XXH_NOESCAPE XXH64_state_t* state, XXH_NOESCAPE const void* input,
             state->memsize = 0;
         }
 
-        if (p+32 <= bEnd) {
+        /* Compared as a distance, since p+32 is past the end of the input
+         * when fewer than 32 bytes are left, and C does not allow forming it. */
+        if ((size_t)(bEnd - p) >= 32) {
             const xxh_u8* const limit = bEnd - 32;
 
             do {

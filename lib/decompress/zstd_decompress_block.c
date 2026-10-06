@@ -818,20 +818,30 @@ HINT_INLINE void ZSTD_overlapCopy8(BYTE** op, BYTE const** ip, size_t offset)
         (*op)[3] = (*ip)[3];
         *ip += dec32table[offset];
         ZSTD_copy4(*op+4, *ip);
-        *ip -= sub2;
+        /* Step back by sub2 and forward by 8 in one move. Taking them one at
+         * a time would point ip up to 7 bytes before the start of the buffer
+         * when the match starts near it, and C does not allow forming that
+         * pointer even if it is never read through. */
+        *ip += 8 - sub2;
     } else {
         ZSTD_copy8(*op, *ip);
+        *ip += 8;
     }
-    *ip += 8;
     *op += 8;
     assert(*op - *ip >= 8);
 }
 
 /*! ZSTD_safecopy() :
  *  Specialized version of memcpy() that is allowed to READ up to WILDCOPY_OVERLENGTH past the input buffer
- *  and write up to 16 bytes past oend_w (op >= oend_w is allowed).
+ *  and write up to WILDCOPY_OVERLENGTH bytes past the end of the copy, as long as those writes stay before
+ *  wlimit (op >= wlimit - WILDCOPY_OVERLENGTH is allowed).
  *  This function is only called in the uncommon case where the sequence is near the end of the block. It
  *  should be fast for a single long sequence, but can be slow for several short sequences.
+ *
+ *  wlimit is the end of the room itself rather than WILDCOPY_OVERLENGTH before it, and the room is
+ *  measured as a distance, because when the room is shorter than WILDCOPY_OVERLENGTH the pointer
+ *  WILDCOPY_OVERLENGTH before its end would be before the start of the buffer, and C does not allow
+ *  forming that pointer even to compare it.
  *
  *  @param ovtype controls the overlap detection
  *         - ZSTD_no_overlap: The source and destination are guaranteed to be at least WILDCOPY_VECLEN bytes apart.
@@ -839,12 +849,13 @@ HINT_INLINE void ZSTD_overlapCopy8(BYTE** op, BYTE const** ip, size_t offset)
  *           The src buffer must be before the dst buffer.
  */
 static void
-ZSTD_safecopy(BYTE* op, const BYTE* const oend_w, BYTE const* ip, size_t length, ZSTD_overlap_e ovtype)
+ZSTD_safecopy(BYTE* op, const BYTE* const wlimit, BYTE const* ip, size_t length, ZSTD_overlap_e ovtype)
 {
     ptrdiff_t const diff = op - ip;
     BYTE* const oend = op + length;
+    size_t room;
 
-    assert((ovtype == ZSTD_no_overlap && (diff <= -8 || diff >= 8 || op >= oend_w)) ||
+    assert((ovtype == ZSTD_no_overlap && (diff <= -8 || diff >= 8 || op >= wlimit || (size_t)(wlimit - op) <= WILDCOPY_OVERLENGTH)) ||
            (ovtype == ZSTD_overlap_src_before_dst && diff >= 0));
 
     if (length < 8) {
@@ -862,17 +873,19 @@ ZSTD_safecopy(BYTE* op, const BYTE* const oend_w, BYTE const* ip, size_t length,
         assert(op <= oend);
     }
 
-    if (oend <= oend_w) {
+    room = op < wlimit ? (size_t)(wlimit - op) : 0;
+    if (room >= length + WILDCOPY_OVERLENGTH) {
         /* No risk of overwrite. */
         ZSTD_wildcopy(op, ip, length, ovtype);
         return;
     }
-    if (op <= oend_w) {
+    if (room >= WILDCOPY_OVERLENGTH) {
         /* Wildcopy until we get close to the end. */
-        assert(oend > oend_w);
-        ZSTD_wildcopy(op, ip, (size_t)(oend_w - op), ovtype);
-        ip += oend_w - op;
-        op += oend_w - op;
+        size_t const head = room - WILDCOPY_OVERLENGTH;
+        assert(head < length);
+        ZSTD_wildcopy(op, ip, head, ovtype);
+        ip += head;
+        op += head;
     }
     /* Handle the leftovers. */
     while (op < oend) *op++ = *ip++;
@@ -909,6 +922,12 @@ static void ZSTD_safecopyDstBeforeSrc(BYTE* op, const BYTE* ip, size_t length)
  *
  * NOTE: This function needs to be fast for a single long sequence, but doesn't need
  * to be optimized for many small sequences, since those fall into ZSTD_execSequence().
+ *
+ * The ends of the literals and the start of the match are only formed once the
+ * lengths and the offset behind them have been checked against their buffers. A
+ * corrupted sequence can carry a length or an offset that reaches outside the
+ * buffer, and C does not allow forming such a pointer even to compare it, so the
+ * checks work on distances and the pointers come after.
  */
 FORCE_NOINLINE
 ZSTD_ALLOW_POINTER_OVERFLOW_ATTR
@@ -917,68 +936,73 @@ size_t ZSTD_execSequenceEnd(BYTE* op,
     const BYTE** litPtr, const BYTE* const litLimit,
     const BYTE* const prefixStart, const BYTE* const virtualStart, const BYTE* const dictEnd)
 {
-    BYTE* const oLitEnd = op + sequence.litLength;
     size_t const sequenceLength = sequence.litLength + sequence.matchLength;
-    const BYTE* const iLitEnd = *litPtr + sequence.litLength;
-    const BYTE* match = oLitEnd - sequence.offset;
-    BYTE* const oend_w = oend - WILDCOPY_OVERLENGTH;
+    BYTE* oLitEnd;
+    const BYTE* iLitEnd;
+    const BYTE* match;
 
     /* bounds checks : careful of address space overflow in 32-bit mode */
     RETURN_ERROR_IF(sequenceLength > (size_t)(oend - op), dstSize_tooSmall, "last match must fit within dstBuffer");
     RETURN_ERROR_IF(sequence.litLength > (size_t)(litLimit - *litPtr), corruption_detected, "try to read beyond literal buffer");
+    oLitEnd = op + sequence.litLength;
+    iLitEnd = *litPtr + sequence.litLength;
     assert(op < op + sequenceLength);
     assert(oLitEnd < op + sequenceLength);
 
     /* copy literals */
-    ZSTD_safecopy(op, oend_w, *litPtr, sequence.litLength, ZSTD_no_overlap);
+    ZSTD_safecopy(op, oend, *litPtr, sequence.litLength, ZSTD_no_overlap);
     op = oLitEnd;
     *litPtr = iLitEnd;
 
     /* copy Match */
     if (sequence.offset > (size_t)(oLitEnd - prefixStart)) {
         /* offset beyond prefix */
+        size_t const intoDict = sequence.offset - (size_t)(oLitEnd - prefixStart);
         RETURN_ERROR_IF(sequence.offset > (size_t)(oLitEnd - virtualStart), corruption_detected, "");
-        match = dictEnd - (prefixStart - match);
-        if (match + sequence.matchLength <= dictEnd) {
+        match = dictEnd - intoDict;
+        if (sequence.matchLength <= intoDict) {
             ZSTD_memmove(oLitEnd, match, sequence.matchLength);
             return sequenceLength;
         }
         /* span extDict & currentPrefixSegment */
-        {   size_t const length1 = (size_t)(dictEnd - match);
-            ZSTD_memmove(oLitEnd, match, length1);
-            op = oLitEnd + length1;
-            sequence.matchLength -= length1;
-            match = prefixStart;
-        }
+        ZSTD_memmove(oLitEnd, match, intoDict);
+        op = oLitEnd + intoDict;
+        sequence.matchLength -= intoDict;
+        match = prefixStart;
+    } else {
+        match = oLitEnd - sequence.offset;
     }
-    ZSTD_safecopy(op, oend_w, match, sequence.matchLength, ZSTD_overlap_src_before_dst);
+    ZSTD_safecopy(op, oend, match, sequence.matchLength, ZSTD_overlap_src_before_dst);
     return sequenceLength;
 }
 
 /* ZSTD_execSequenceEndSplitLitBuffer():
  * This version is intended to be used during instances where the litBuffer is still split.  It is kept separate to avoid performance impact for the good case.
+ * The output must not run into the literals still to be read, so the room for the match ends where
+ * this sequence's literals end, which is the next unread literal.
  */
 FORCE_NOINLINE
 ZSTD_ALLOW_POINTER_OVERFLOW_ATTR
 size_t ZSTD_execSequenceEndSplitLitBuffer(BYTE* op,
-    BYTE* const oend, const BYTE* const oend_w, seq_t sequence,
+    BYTE* const oend, seq_t sequence,
     const BYTE** litPtr, const BYTE* const litLimit,
     const BYTE* const prefixStart, const BYTE* const virtualStart, const BYTE* const dictEnd)
 {
-    BYTE* const oLitEnd = op + sequence.litLength;
     size_t const sequenceLength = sequence.litLength + sequence.matchLength;
-    const BYTE* const iLitEnd = *litPtr + sequence.litLength;
-    const BYTE* match = oLitEnd - sequence.offset;
-
+    BYTE* oLitEnd;
+    const BYTE* iLitEnd;
+    const BYTE* match;
 
     /* bounds checks : careful of address space overflow in 32-bit mode */
     RETURN_ERROR_IF(sequenceLength > (size_t)(oend - op), dstSize_tooSmall, "last match must fit within dstBuffer");
     RETURN_ERROR_IF(sequence.litLength > (size_t)(litLimit - *litPtr), corruption_detected, "try to read beyond literal buffer");
+    oLitEnd = op + sequence.litLength;
+    iLitEnd = *litPtr + sequence.litLength;
     assert(op < op + sequenceLength);
     assert(oLitEnd < op + sequenceLength);
 
     /* copy literals */
-    RETURN_ERROR_IF(op > *litPtr && op < *litPtr + sequence.litLength, dstSize_tooSmall, "output should not catch up to and overwrite literal buffer");
+    RETURN_ERROR_IF(op > *litPtr && op < iLitEnd, dstSize_tooSmall, "output should not catch up to and overwrite literal buffer");
     ZSTD_safecopyDstBeforeSrc(op, *litPtr, sequence.litLength);
     op = oLitEnd;
     *litPtr = iLitEnd;
@@ -986,21 +1010,22 @@ size_t ZSTD_execSequenceEndSplitLitBuffer(BYTE* op,
     /* copy Match */
     if (sequence.offset > (size_t)(oLitEnd - prefixStart)) {
         /* offset beyond prefix */
+        size_t const intoDict = sequence.offset - (size_t)(oLitEnd - prefixStart);
         RETURN_ERROR_IF(sequence.offset > (size_t)(oLitEnd - virtualStart), corruption_detected, "");
-        match = dictEnd - (prefixStart - match);
-        if (match + sequence.matchLength <= dictEnd) {
+        match = dictEnd - intoDict;
+        if (sequence.matchLength <= intoDict) {
             ZSTD_memmove(oLitEnd, match, sequence.matchLength);
             return sequenceLength;
         }
         /* span extDict & currentPrefixSegment */
-        {   size_t const length1 = (size_t)(dictEnd - match);
-            ZSTD_memmove(oLitEnd, match, length1);
-            op = oLitEnd + length1;
-            sequence.matchLength -= length1;
-            match = prefixStart;
-        }
+        ZSTD_memmove(oLitEnd, match, intoDict);
+        op = oLitEnd + intoDict;
+        sequence.matchLength -= intoDict;
+        match = prefixStart;
+    } else {
+        match = oLitEnd - sequence.offset;
     }
-    ZSTD_safecopy(op, oend_w, match, sequence.matchLength, ZSTD_overlap_src_before_dst);
+    ZSTD_safecopy(op, iLitEnd, match, sequence.matchLength, ZSTD_overlap_src_before_dst);
     return sequenceLength;
 }
 
@@ -1011,38 +1036,45 @@ size_t ZSTD_execSequence(BYTE* op,
     const BYTE** litPtr, const BYTE* const litLimit,
     const BYTE* const prefixStart, const BYTE* const virtualStart, const BYTE* const dictEnd)
 {
-    BYTE* const oLitEnd = op + sequence.litLength;
     size_t const sequenceLength = sequence.litLength + sequence.matchLength;
-    BYTE* const oMatchEnd = op + sequenceLength;   /* risk : address space overflow (32-bits) */
-    BYTE* const oend_w = oend - WILDCOPY_OVERLENGTH;   /* risk : address space underflow on oend=NULL */
-    const BYTE* const iLitEnd = *litPtr + sequence.litLength;
-    const BYTE* match = oLitEnd - sequence.offset;
+    BYTE* oLitEnd;
+    BYTE* oMatchEnd;
+    const BYTE* iLitEnd;
+    const BYTE* match;
 
     assert(op != NULL /* Precondition */);
-    assert(oend_w < oend /* No underflow */);
+    assert(op <= oend /* Precondition */);
 
-#if defined(__aarch64__)
-    /* prefetch sequence starting from match that will be used for copy later */
-    PREFETCH_L1(match);
-#endif
     /* Handle edge cases in a slow path:
      *   - Read beyond end of literals
      *   - Match end is within WILDCOPY_OVERLIMIT of oend
-     *   - 32-bit mode and the match length overflows
+     * Both are tested as distances rather than by forming the end pointers, since
+     * those can be outside the buffers when the sequence is corrupted.
+     * litLength and matchLength are each far below 2^31, so sequenceLength +
+     * WILDCOPY_OVERLENGTH does not overflow even in 32-bit mode.
      */
     if (UNLIKELY(
-        iLitEnd > litLimit ||
-        oMatchEnd > oend_w ||
-        (MEM_32bits() && (size_t)(oend - op) < sequenceLength + WILDCOPY_OVERLENGTH)))
+        sequence.litLength > (size_t)(litLimit - *litPtr) ||
+        (size_t)(oend - op) < sequenceLength + WILDCOPY_OVERLENGTH))
         return ZSTD_execSequenceEnd(op, oend, sequence, litPtr, litLimit, prefixStart, virtualStart, dictEnd);
+
+    oLitEnd = op + sequence.litLength;
+    oMatchEnd = op + sequenceLength;
+    (void)oMatchEnd;   /* only read by asserts */
+    iLitEnd = *litPtr + sequence.litLength;
+
+#if defined(__aarch64__)
+    /* prefetch sequence starting from match that will be used for copy later */
+    if (sequence.offset <= (size_t)(oLitEnd - prefixStart))
+        PREFETCH_L1(oLitEnd - sequence.offset);
+#endif
 
     /* Assumptions (everything else goes into ZSTD_execSequenceEnd()) */
     assert(op <= oLitEnd /* No overflow */);
     assert(oLitEnd < oMatchEnd /* Non-zero match & no overflow */);
     assert(oMatchEnd <= oend /* No underflow */);
     assert(iLitEnd <= litLimit /* Literal length is in bounds */);
-    assert(oLitEnd <= oend_w /* Can wildcopy literals */);
-    assert(oMatchEnd <= oend_w /* Can wildcopy matches */);
+    assert((size_t)(oend - oMatchEnd) >= WILDCOPY_OVERLENGTH /* Can wildcopy literals and matches */);
 
     /* Copy Literals:
      * Split out litLength <= 16 since it is nearly always true. +1.6% on gcc-9.
@@ -1059,23 +1091,24 @@ size_t ZSTD_execSequence(BYTE* op,
     /* Copy Match */
     if (sequence.offset > (size_t)(oLitEnd - prefixStart)) {
         /* offset beyond prefix -> go into extDict */
+        size_t const intoDict = sequence.offset - (size_t)(oLitEnd - prefixStart);
         RETURN_ERROR_IF(UNLIKELY(sequence.offset > (size_t)(oLitEnd - virtualStart)), corruption_detected, "");
-        match = dictEnd + (match - prefixStart);
-        if (match + sequence.matchLength <= dictEnd) {
+        match = dictEnd - intoDict;
+        if (sequence.matchLength <= intoDict) {
             ZSTD_memmove(oLitEnd, match, sequence.matchLength);
             return sequenceLength;
         }
         /* span extDict & currentPrefixSegment */
-        {   size_t const length1 = (size_t)(dictEnd - match);
-            ZSTD_memmove(oLitEnd, match, length1);
-            op = oLitEnd + length1;
-            sequence.matchLength -= length1;
-            match = prefixStart;
-        }
+        ZSTD_memmove(oLitEnd, match, intoDict);
+        op = oLitEnd + intoDict;
+        sequence.matchLength -= intoDict;
+        match = prefixStart;
+    } else {
+        match = oLitEnd - sequence.offset;
     }
     /* Match within prefix of 1 or more bytes */
     assert(op <= oMatchEnd);
-    assert(oMatchEnd <= oend_w);
+    assert((size_t)(oend - oMatchEnd) >= WILDCOPY_OVERLENGTH);
     assert(match >= prefixStart);
     assert(sequence.matchLength >= 1);
 
@@ -1103,39 +1136,50 @@ size_t ZSTD_execSequence(BYTE* op,
     return sequenceLength;
 }
 
+/* ZSTD_execSequenceSplitLitBuffer():
+ * The same as ZSTD_execSequence() for while the literals are still in dst ahead of the output.
+ * The output and its wildcopy overrun must stay before the next unread literal, which is where
+ * this sequence's literals end, so that is the end of the room rather than oend.
+ */
 HINT_INLINE
 ZSTD_ALLOW_POINTER_OVERFLOW_ATTR
 size_t ZSTD_execSequenceSplitLitBuffer(BYTE* op,
-    BYTE* const oend, const BYTE* const oend_w, seq_t sequence,
+    BYTE* const oend, seq_t sequence,
     const BYTE** litPtr, const BYTE* const litLimit,
     const BYTE* const prefixStart, const BYTE* const virtualStart, const BYTE* const dictEnd)
 {
-    BYTE* const oLitEnd = op + sequence.litLength;
     size_t const sequenceLength = sequence.litLength + sequence.matchLength;
-    BYTE* const oMatchEnd = op + sequenceLength;   /* risk : address space overflow (32-bits) */
-    const BYTE* const iLitEnd = *litPtr + sequence.litLength;
-    const BYTE* match = oLitEnd - sequence.offset;
+    BYTE* oLitEnd;
+    BYTE* oMatchEnd;
+    const BYTE* iLitEnd;
+    const BYTE* match;
 
     assert(op != NULL /* Precondition */);
-    assert(oend_w < oend /* No underflow */);
     /* Handle edge cases in a slow path:
      *   - Read beyond end of literals
-     *   - Match end is within WILDCOPY_OVERLIMIT of oend
-     *   - 32-bit mode and the match length overflows
+     *   - Match end is within WILDCOPY_OVERLIMIT of the next unread literal
+     * As in ZSTD_execSequence(), these are distances, and the end of the
+     * literals is only formed once it is known to be inside their buffer.
      */
+    if (UNLIKELY(sequence.litLength > (size_t)(litLimit - *litPtr)))
+        return ZSTD_execSequenceEndSplitLitBuffer(op, oend, sequence, litPtr, litLimit, prefixStart, virtualStart, dictEnd);
+    iLitEnd = *litPtr + sequence.litLength;
     if (UNLIKELY(
-            iLitEnd > litLimit ||
-            oMatchEnd > oend_w ||
-            (MEM_32bits() && (size_t)(oend - op) < sequenceLength + WILDCOPY_OVERLENGTH)))
-        return ZSTD_execSequenceEndSplitLitBuffer(op, oend, oend_w, sequence, litPtr, litLimit, prefixStart, virtualStart, dictEnd);
+            op > iLitEnd ||
+            (size_t)(iLitEnd - op) < sequenceLength + WILDCOPY_OVERLENGTH ||
+            (size_t)(oend - op) < sequenceLength + WILDCOPY_OVERLENGTH))
+        return ZSTD_execSequenceEndSplitLitBuffer(op, oend, sequence, litPtr, litLimit, prefixStart, virtualStart, dictEnd);
+
+    oLitEnd = op + sequence.litLength;
+    oMatchEnd = op + sequenceLength;
+    (void)oMatchEnd;   /* only read by asserts */
 
     /* Assumptions (everything else goes into ZSTD_execSequenceEnd()) */
     assert(op <= oLitEnd /* No overflow */);
     assert(oLitEnd < oMatchEnd /* Non-zero match & no overflow */);
     assert(oMatchEnd <= oend /* No underflow */);
     assert(iLitEnd <= litLimit /* Literal length is in bounds */);
-    assert(oLitEnd <= oend_w /* Can wildcopy literals */);
-    assert(oMatchEnd <= oend_w /* Can wildcopy matches */);
+    assert((size_t)(iLitEnd - oMatchEnd) >= WILDCOPY_OVERLENGTH /* Can wildcopy literals and matches */);
 
     /* Copy Literals:
      * Split out litLength <= 16 since it is nearly always true. +1.6% on gcc-9.
@@ -1152,22 +1196,24 @@ size_t ZSTD_execSequenceSplitLitBuffer(BYTE* op,
     /* Copy Match */
     if (sequence.offset > (size_t)(oLitEnd - prefixStart)) {
         /* offset beyond prefix -> go into extDict */
+        size_t const intoDict = sequence.offset - (size_t)(oLitEnd - prefixStart);
         RETURN_ERROR_IF(UNLIKELY(sequence.offset > (size_t)(oLitEnd - virtualStart)), corruption_detected, "");
-        match = dictEnd + (match - prefixStart);
-        if (match + sequence.matchLength <= dictEnd) {
+        match = dictEnd - intoDict;
+        if (sequence.matchLength <= intoDict) {
             ZSTD_memmove(oLitEnd, match, sequence.matchLength);
             return sequenceLength;
         }
         /* span extDict & currentPrefixSegment */
-        {   size_t const length1 = (size_t)(dictEnd - match);
-            ZSTD_memmove(oLitEnd, match, length1);
-            op = oLitEnd + length1;
-            sequence.matchLength -= length1;
-            match = prefixStart;
-    }   }
+        ZSTD_memmove(oLitEnd, match, intoDict);
+        op = oLitEnd + intoDict;
+        sequence.matchLength -= intoDict;
+        match = prefixStart;
+    } else {
+        match = oLitEnd - sequence.offset;
+    }
     /* Match within prefix of 1 or more bytes */
     assert(op <= oMatchEnd);
-    assert(oMatchEnd <= oend_w);
+    assert((size_t)(iLitEnd - oMatchEnd) >= WILDCOPY_OVERLENGTH);
     assert(match >= prefixStart);
     assert(sequence.matchLength >= 1);
 
@@ -1194,7 +1240,6 @@ size_t ZSTD_execSequenceSplitLitBuffer(BYTE* op,
     }
     return sequenceLength;
 }
-
 
 static void
 ZSTD_initFseState(ZSTD_fseState* DStatePtr, BIT_DStream_t* bitD, const ZSTD_seqSymbol* dt)
@@ -1596,8 +1641,8 @@ ZSTD_decompressSequences_bodySplitLitBuffer( ZSTD_DCtx* dctx,
             /* Handle the initial state where litBuffer is currently split between dst and litExtraBuffer */
             for ( ; nbSeq; nbSeq--) {
                 sequence = ZSTD_decodeSequence(&seqState, isLongOffset, nbSeq==1);
-                if (litPtr + sequence.litLength > dctx->litBufferEnd) break;
-                {   size_t const oneSeqSize = ZSTD_execSequenceSplitLitBuffer(op, oend, litPtr + sequence.litLength - WILDCOPY_OVERLENGTH, sequence, &litPtr, litBufferEnd, prefixStart, vBase, dictEnd);
+                if (sequence.litLength > (size_t)(dctx->litBufferEnd - litPtr)) break;
+                {   size_t const oneSeqSize = ZSTD_execSequenceSplitLitBuffer(op, oend, sequence, &litPtr, litBufferEnd, prefixStart, vBase, dictEnd);
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && defined(FUZZING_ASSERT_VALID_SEQUENCE)
                     assert(!ZSTD_isError(oneSeqSize));
                     ZSTD_assertValidSequence(dctx, op, oend, sequence, prefixStart, vBase);
@@ -1607,7 +1652,7 @@ ZSTD_decompressSequences_bodySplitLitBuffer( ZSTD_DCtx* dctx,
                     DEBUGLOG(6, "regenerated sequence size : %u", (U32)oneSeqSize);
                     op += oneSeqSize;
             }   }
-            DEBUGLOG(6, "reached: (litPtr + sequence.litLength > dctx->litBufferEnd)");
+            DEBUGLOG(6, "reached: (sequence.litLength > dctx->litBufferEnd - litPtr)");
 
             /* If there are more sequences, they will need to read literals from litExtraBuffer; copy over the remainder from dst and update litPtr and litEnd */
             if (nbSeq > 0) {
@@ -1876,7 +1921,7 @@ ZSTD_decompressSequencesLong_body(
         for (; seqNb < nbSeq; seqNb++) {
             seq_t sequence = ZSTD_decodeSequence(&seqState, isLongOffset, seqNb == nbSeq-1);
 
-            if (dctx->litBufferLocation == ZSTD_split && litPtr + sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK].litLength > dctx->litBufferEnd) {
+            if (dctx->litBufferLocation == ZSTD_split && sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK].litLength > (size_t)(dctx->litBufferEnd - litPtr)) {
                 /* lit buffer is reaching split point, empty out the first buffer and transition to litExtraBuffer */
                 const size_t leftoverLit = (size_t)(dctx->litBufferEnd - litPtr);
                 assert(dctx->litBufferEnd >= litPtr);
@@ -1904,7 +1949,7 @@ ZSTD_decompressSequencesLong_body(
             {
                 /* lit buffer is either wholly contained in first or second split, or not split at all*/
                 size_t const oneSeqSize = dctx->litBufferLocation == ZSTD_split ?
-                    ZSTD_execSequenceSplitLitBuffer(op, oend, litPtr + sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK].litLength - WILDCOPY_OVERLENGTH, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK], &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd) :
+                    ZSTD_execSequenceSplitLitBuffer(op, oend, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK], &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd) :
                     ZSTD_execSequence(op, oend, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK], &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd);
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && defined(FUZZING_ASSERT_VALID_SEQUENCE)
                 assert(!ZSTD_isError(oneSeqSize));
@@ -1923,7 +1968,7 @@ ZSTD_decompressSequencesLong_body(
         seqNb -= seqAdvance;
         for ( ; seqNb<nbSeq ; seqNb++) {
             seq_t *sequence = &(sequences[seqNb&STORED_SEQS_MASK]);
-            if (dctx->litBufferLocation == ZSTD_split && litPtr + sequence->litLength > dctx->litBufferEnd) {
+            if (dctx->litBufferLocation == ZSTD_split && sequence->litLength > (size_t)(dctx->litBufferEnd - litPtr)) {
                 const size_t leftoverLit = (size_t)(dctx->litBufferEnd - litPtr);
                 assert(dctx->litBufferEnd >= litPtr);
                 if (leftoverLit) {
@@ -1947,7 +1992,7 @@ ZSTD_decompressSequencesLong_body(
             else
             {
                 size_t const oneSeqSize = dctx->litBufferLocation == ZSTD_split ?
-                    ZSTD_execSequenceSplitLitBuffer(op, oend, litPtr + sequence->litLength - WILDCOPY_OVERLENGTH, *sequence, &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd) :
+                    ZSTD_execSequenceSplitLitBuffer(op, oend, *sequence, &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd) :
                     ZSTD_execSequence(op, oend, *sequence, &litPtr, litBufferEnd, prefixStart, dictStart, dictEnd);
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && defined(FUZZING_ASSERT_VALID_SEQUENCE)
                 assert(!ZSTD_isError(oneSeqSize));

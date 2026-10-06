@@ -256,7 +256,10 @@ MEM_STATIC size_t BIT_initDStream(BIT_DStream_t* bitD, const void* srcBuffer, si
     if (srcSize < 1) { ZSTD_memset(bitD, 0, sizeof(*bitD)); return ERROR(srcSize_wrong); }
 
     bitD->start = (const char*)srcBuffer;
-    bitD->limitPtr = bitD->start + sizeof(bitD->bitContainer);
+    /* On a stream shorter than the container, start + sizeof(bitContainer) would
+     * point past the end of the buffer, which C does not allow forming. Any limit
+     * above start keeps such a stream on the cautious path, so its end will do. */
+    bitD->limitPtr = bitD->start + (srcSize < sizeof(bitD->bitContainer) ? srcSize : sizeof(bitD->bitContainer));
 
     if (srcSize >=  sizeof(bitD->bitContainer)) {  /* normal case */
         bitD->ptr   = (const char*)srcBuffer + srcSize - sizeof(bitD->bitContainer);
@@ -432,7 +435,7 @@ FORCE_INLINE_TEMPLATE BIT_DStream_status BIT_reloadDStream(BIT_DStream_t* bitD)
     /* start < ptr < limitPtr => cautious update */
     {   U32 nbBytes = bitD->bitsConsumed >> 3;
         BIT_DStream_status result = BIT_DStream_unfinished;
-        if (bitD->ptr - nbBytes < bitD->start) {
+        if (nbBytes > (size_t)(bitD->ptr - bitD->start)) {
             nbBytes = (U32)(bitD->ptr - bitD->start);  /* ptr > start */
             result = BIT_DStream_endOfBuffer;
         }
