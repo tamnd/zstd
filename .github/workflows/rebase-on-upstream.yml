@@ -1,0 +1,52 @@
+name: Rebase on upstream
+
+# This fork keeps a few fixes on top of upstream. Once a day, and on demand, put them back on top
+# of the latest upstream branch so the fork never falls behind. A conflict fails the job and leaves
+# the branch as it was, so someone has to rebase by hand.
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-on-upstream
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM: https://github.com/facebook/zstd
+      BRANCH: dev
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          # A token with the workflow scope is needed when upstream changes its own workflow
+          # files, since the default token may not push those. Without one, the job still works
+          # until that happens.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "$UPSTREAM" "$BRANCH"
+          old=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "$BRANCH already sits on top of upstream"
+            exit 0
+          fi
+          echo "Our commits on top of upstream:"
+          git log --oneline FETCH_HEAD..HEAD
+          if ! git rebase --committer-date-is-author-date FETCH_HEAD; then
+            git rebase --abort
+            echo "::error::rebasing $BRANCH onto upstream conflicts, rebase it by hand"
+            exit 1
+          fi
+          git push --force-with-lease="$BRANCH:$old" origin "HEAD:$BRANCH"
