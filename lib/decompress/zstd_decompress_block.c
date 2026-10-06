@@ -111,8 +111,10 @@ static void ZSTD_allocateLiteralsBuffer(ZSTD_DCtx* dctx, void* const dst, const 
          */
         if (splitImmediately) {
             /* won't fit in litExtraBuffer, so it will be split between end of dst and extra buffer */
-            dctx->litBuffer = (BYTE*)dst + expectedWriteSize - litSize + ZSTD_LITBUFFEREXTRASIZE - WILDCOPY_OVERLENGTH;
-            dctx->litBufferEnd = dctx->litBuffer + litSize - ZSTD_LITBUFFEREXTRASIZE;
+            /* litSize > ZSTD_LITBUFFEREXTRASIZE here, so the end is formed from the part of the
+             * literals that stays in dst; litBuffer + litSize would run past the buffer. */
+            dctx->litBuffer = (BYTE*)dst + (expectedWriteSize - litSize) + (ZSTD_LITBUFFEREXTRASIZE - WILDCOPY_OVERLENGTH);
+            dctx->litBufferEnd = dctx->litBuffer + (litSize - ZSTD_LITBUFFEREXTRASIZE);
         } else {
             /* initially this will be stored entirely in dst during huffman decoding, it will partially be shifted to litExtraBuffer after */
             dctx->litBuffer = (BYTE*)dst + expectedWriteSize - litSize;
@@ -905,10 +907,13 @@ static void ZSTD_safecopyDstBeforeSrc(BYTE* op, const BYTE* ip, size_t length)
         return;
     }
 
-    if (op <= oend - WILDCOPY_OVERLENGTH && diff < -WILDCOPY_VECLEN) {
-        ZSTD_wildcopy(op, ip, (size_t)(oend - WILDCOPY_OVERLENGTH - op), ZSTD_no_overlap);
-        ip += oend - WILDCOPY_OVERLENGTH - op;
-        op += oend - WILDCOPY_OVERLENGTH - op;
+    /* Compare the length rather than oend - WILDCOPY_OVERLENGTH, which is before the start
+     * of the buffer when the copy is short and op is near that start. */
+    if (length >= WILDCOPY_OVERLENGTH && diff < -WILDCOPY_VECLEN) {
+        size_t const head = length - WILDCOPY_OVERLENGTH;
+        ZSTD_wildcopy(op, ip, head, ZSTD_no_overlap);
+        ip += head;
+        op += head;
     }
 
     /* Handle the leftovers. */
